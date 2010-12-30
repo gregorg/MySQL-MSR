@@ -1,0 +1,72 @@
+####################################################
+# mysql_msr.pl - MySQL Multiple Source Replication #
+####################################################
+# Author: Grégory <gregorg> Duchatelet <skygreg@gmail.com>
+#
+
+#
+# Docs
+#
+This script add the ability to a running MySQL slave, to replicate
+from many masters.
+Each masters MUST have different databases names.
+
+It is not as safe and fast as the official MySQL worklog :
+http://forge.mysql.com/worklog/task.php?id=1697
+and has less features, but it simply works ...
+The main feature is to replicate from masters in parallel.
+
+This script forks himself, 2 process per master:
+- one for IO, fetching new binlogs from the master, via a spawn of mysqlbinlog
+- one for SQL, which read parsed binlogs and executed them via piping to mysql client.
+
+             _ mysqlbinlog --read-from-remote-server > relaylogs
+            /
+master A --<
+            \_ cat relaylogs | mysql -hmsr
+
+# 
+# Warnings
+#
+However, a couple people have documented places where replication produces different 
+results than 'mysqlbinlog <log> | myslql'
+
+Another approach consists of doing a circular replication between masters.
+This approach is safer as it use mysql nativ replication mecanism,
+but slower as only one master is replicated at a time.
+
+
+#
+# Configuration
+#
+Grants: you need a mysql user with ALL privileges, GRANT OPTION, and SUPER
+GRANT ALL PRIVILEGES ON *.* TO 'msruser'@'10.0.%' IDENTIFIED BY 'the_complex_password' WITH GRANT OPTION;
+GRANT SUPER ON *.* TO 'msruser'@'10.0.%';
+
+Configure msr.ini:
+- "management" is the mysql host that will host "msr" database
+- "mysql" is the final destination mysql host.
+
+Then you need the "msr" database, try with "mysql_msr.pl --setup" which will read configuration from msr.ini.
+
+#
+# First start
+#
+You must start it in verbose and foreground mode with "-v -v -v" options.
+
+#
+# Typical (and tested) configuration:
+#
+this script is running on the destination server (which could be the same
+that the management host), the slave is configured to replicate "main" datas 
+from "main master", a management database is need, by default named "msr",
+on this database you configure masters to replicate from, with eventually greylisting.
+Greylist = which databases to replicate, or which to not replicate.
+Filtering is done only on database, not tables.
+
+# 
+# TODO
+#
+Documentations, debugging.
+Will be done upon requests.
+
