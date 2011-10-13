@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!/usr/bin/perl
 #######################################################################
 # Copyright (c) 2010 Grégory Duchatelet <skygreg@gmail.com>
 #
@@ -997,7 +997,7 @@ use IPC::Open3;
 Log->import();
 use constant EZDEBUG => $ENV{EZDEBUG} || 0;
 use constant PROCESSES => ('IO', 'SQL');
-#use constant PROCESSES => ('IO');
+#use constant PROCESSES => ('SQL');
 
 sub new
 {
@@ -1090,8 +1090,9 @@ sub stop
 
 sub mysqlbinlog
 {
-	my ($self, $rl) = @_;
+	my ($self, $rl, $delay) = @_;
 	my $slave = $self->{slave};
+	my $stopdatetime = strftime('%Y-%m-%d %H:%M:%S', localtime(time() - $delay - 60));
 	my $mysqlbin = defined($self->{config}{general}{mysqlbin}) ? $self->{config}{general}{mysqlbin} : '/usr/local/mysql/bin';
 	my @params = qw/--no-defaults --set-charset UTF8 --read-from-remote-server/;
 	push @params, '--user', $slave->{user};
@@ -1099,6 +1100,7 @@ sub mysqlbinlog
 	push @params, '--host', $slave->{host} if ($slave->{host});
 	push @params, '--port', $slave->{port} if ($slave->{port});
 	push @params, '--socket', $slave->{sock} if ($slave->{sock});
+	push @params, '--stop-datetime', $stopdatetime;
 
 	$rl->{current_pos} = defined($rl->{current_pos}) ? $rl->{current_pos} : $rl->{start_pos};
 
@@ -1106,6 +1108,7 @@ sub mysqlbinlog
 	my @cllog = ($mysqlbin, '/mysqlbinlog ', map { "$_ " } @params);
 	_l(3, $self->{logprefix}, grep { $_ !~ /^--password/ } @cllog);
 
+	# TODO: put this open3 in an eval()
 	my $mblpid = open3(*BL_IN, *BL_OUT, *BL_ERR, $mysqlbin.'/mysqlbinlog', @params);
 	close BL_IN;
 	return $mblpid;
@@ -1270,6 +1273,14 @@ sub IO
 				last;
 			}
 
+			# Wait if mysql replication is stopped
+			my $delay = $self->{mgr}->get_slave_delay();
+			if ($delay < 0)
+			{
+				sleep $self->{bigpause};
+				next;
+			}
+
 			# refresh config...
 			$self->refresh_config;
 			my ($parsed, $added, $excluded) = (0, 0, 0);
@@ -1278,7 +1289,7 @@ sub IO
 			my $binlog = new Binlog($self->{mgr}->get_last_binlogfile($slave));
 
 			last if ($self->{stop});
-			my $mblpid = $self->mysqlbinlog($self->{mgr}->get_last_relaylog($slave));
+			my $mblpid = $self->mysqlbinlog($self->{mgr}->get_last_relaylog($slave), $delay);
 			unless($mblpid)
 			{
 				sleep $self->{bigpause};
@@ -1292,7 +1303,6 @@ sub IO
 				$self->{error} = "Unable to start mysqlbinlog";
 				last; # exit this while
 			}
-
 
 			my $rl = $self->{mgr}->get_last_relaylog($slave);
 			unless (open RELAY, ">".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp")
@@ -1350,9 +1360,20 @@ sub IO
 			{
 				if ($binlog->is_rotate or ($parsed > 2 and $added > 2))
 				{
-					unless(rename($self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp", $self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id})))
+					my $gzipped = "";
+					# Try to gzip relay log file
+					if (system("/bin/gzip -1 '".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp"."'") == 0)
 					{
-						_l(2, $self->{logprefix}."unable to rename ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp"." to ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id})." : $!");
+						$gzipped = ".gz";
+					}
+					else
+					{
+						_l(2, $self->{logprefix}."unable to gzip ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp");
+					}
+
+					unless(rename($self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp".$gzipped, $self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).$gzipped))
+					{
+						_l(2, $self->{logprefix}."unable to rename ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp".$gzipped." to ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).$gzipped." : $!");
 					}
 
 					# Next position is next_pos if not at the end of the binary log
@@ -1409,7 +1430,11 @@ sub SQL
 		my $clpid = $self->mysqlclient();
 		
 		# check for errors
-		next if ($self->mysqlclient_errors());
+		if ($self->mysqlclient_errors())
+		{
+			_i($self->{logprefix}.$self->mysqlclient_errors());
+			next;
+		}
 		
 		# fetching and parsing mysqlbinlog output
 		my $binlog;
@@ -1422,6 +1447,7 @@ sub SQL
 			unless ($slave->{enabled})
 			{
 				$self->{stop} = 1;
+				_l(3, $self->{logprefix}."this slave is disabled.");
 				last;
 			}
 
@@ -1442,9 +1468,19 @@ sub SQL
 				sleep $self->{bigpause};
 				next;
 			}
+			if (-e $self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz")
+			{
+				_l(3, $self->{logprefix}."Decompressing relaylog file ...");
+				if (system("/bin/gzip -d '".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz'") > 0)
+				{
+					_i($self->{logprefix}."unable to gunzip ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz: $!");
+					sleep $self->{bigpause};
+					next;
+				}
+			}
 			unless(-e $self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}))
 			{
-				_d($self->{logprefix}."Waiting for ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}));
+				_l(3, $self->{logprefix}."Waiting for ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}));
 				sleep $self->{bigpause};
 				next;
 			}
@@ -1459,6 +1495,7 @@ sub SQL
 			my ($handled, $skipped) = (0, 0);
 			_l(2, $self->{logprefix}."PARSING RELAY LOG ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id})." ...");
 			$self->{mgr}->set_status($slave, 'sql', 'parsing');
+			my $start = time();
 			while (!$self->{stop} and !$self->{error} and !eof(RELAY_IN) and my $l = <RELAY_IN>) # till end 
 			{
 				$binlog->parse($l);
@@ -1495,6 +1532,10 @@ sub SQL
 
 					# to next binlog
 					$binlog = new Binlog($binlog->binlogfile, $binlog->next_pos, $binlog->db, $binlog->delimiter_def);
+				}
+				if ((time() - $start) > 3600/2)
+				{
+					$self->{error} = "Timeout (".(time()-$start).") to handle relaylog ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id});
 				}
 			}
 			close RELAY_IN;
@@ -1925,6 +1966,11 @@ sub fetch
 		return 0;
 	}
 	my %slaves = %{$self->{dbh}->selectall_hashref("SELECT * FROM masters", [ qw(name) ])};
+	unless(%slaves)
+	{
+		_l(2, "Unable to SELECT masters");
+		return 0;
+	}
 	foreach my $slave (keys %slaves)
 	{
 		$slaves{$slave} = _hashref_to_slave($slaves{$slave});
@@ -2261,6 +2307,29 @@ sub get_relay_logs
 	$self->is_connected();
 	$slave = $self->{slaves}->{$slave->{name}};
 	return $self->{dbh}->selectall_hashref("SELECT * FROM relaylogs WHERE master_id=".$slave->{id}." ORDER BY id", [ qw(id) ]);
+}
+
+sub get_slave_delay
+{
+	my ($self) = @_;
+	$self->is_connected();
+	my $sss = $self->{dbh}->selectrow_hashref("SHOW SLAVE STATUS");
+
+	# slave not running
+	if ($sss->{Slave_SQL_Running} !~ /yes/i)
+	{
+		_l(2, "MySQL SQL Slave is stopped...");
+		return -1;
+	}
+	
+	# seconds behind master
+	my $s = $sss->{Seconds_Behind_Master};
+	if ($s eq 'NULL')
+	{
+		_l(2, "MySQL SQL Slave is stopped...");
+		return -2;
+	}
+	return int($s);
 }
 
 sub get_current_binlogfile
@@ -2831,7 +2900,12 @@ sub main
 ##############################################################################
 ## Run the program.
 ##############################################################################
-if ( !caller ) { exit main(@ARGV); }
+if ( !caller ) 
+{ 
+	use File::Basename;
+	$0 = File::Basename::basename($0, ".pl");
+	exit main(@ARGV); 
+}
 
 1; # Because this is a module as well as a script.
 
