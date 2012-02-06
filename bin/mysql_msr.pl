@@ -117,6 +117,7 @@ my %defaultcolors=(
 	'caller' => $colortable{'none'},
 	'date' => $colortable{'none'},
 	'prog' => $colortable{'magenta'},
+	'error' => $colortable{'red'},
 	'msg' => $colortable{'yellow'}
 );
 my @authorized_level_types=('numeric','sequential');		#Level types
@@ -390,7 +391,14 @@ sub wr {
 		#####################################
 		$l .= $header;						#print the header
 	}
-	$l .= $colors{'msg'};
+	if ($error)
+	{
+		$l .= $colors{'error'};
+	}
+	else
+	{
+		$l .= $colors{'msg'};
+	}
 	while (my $tolog=shift) {			#and then print all the things the user wants me to print
 		$l .= $tolog;
 		$return_code.=$tolog;
@@ -417,8 +425,10 @@ sub wr {
 	return $return_code;
 }
 sub error {
+	my $self=shift;
 	$error=1;
-	my $ec=wr(1,$error_header," ",@_);
+	#my $ec=$self->wr(1,$error_header," ",@_);
+	my $ec=$self->wr(1,@_);
 	$error=0;
 	return $ec;
 }
@@ -441,7 +451,7 @@ use English qw(-no_match_vars);
 use Carp;
 use Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT = qw( _l _d _i _dump );
+our @EXPORT = qw( _l _d _i _dump _err);
 
 my $singleton;
 
@@ -481,6 +491,12 @@ sub _d
 sub _i
 {
 	_l(1, @_);
+}
+
+# error
+sub _err
+{
+	$singleton->{logger}->error(@_);
 }
 
 sub _dump
@@ -801,7 +817,7 @@ sub parse
 	}
 	elsif ($line =~ /^ERROR:/ and $line =~ /failed on connect:/i)
 	{
-		_i("Unable to connect to master ".$self->{name}." (".$self->{host}.":".$self->{port}.")");
+		_err("Unable to connect to master ".$self->{name}." (".$self->{host}.":".$self->{port}.")");
 		$self->{is_full} = 1;
 		$self->{error} = "Unable to connect to master";
 	}
@@ -954,12 +970,10 @@ sub date
 	}
 	if ($self->{date} =~ /^\d{6} /)
 	{
-		my ($date, $t) = split(/ /, $self->{date});
-		my @time = split(/:/, $t);
-		# 091124 16:23:39 => Time object
-		my $year = int(substr($date, 0, 2));
+		my ($year, $month, $day, $hour, $min, $sec) = $self->{date} =~ /^(\d{2})(\d{2})(\d{2}) (\d{1,2}):(\d{1,2}):(\d{1,2})/;
+		$year = int($year);
 		$year += 100 if ($year < 70); # OK till 2070 ...
-		$self->{date} = mktime($time[2], $time[1], $time[0], substr($date, 4, 2), substr($date, 2, 2), $year);
+		$self->{date} = mktime($sec, $min, $hour, $day, $month-1, $year);
 	}
 	return $self->{date};
 }
@@ -1157,7 +1171,7 @@ sub mysqlbinlog_errors
 		}
 		else
 		{
-			$self->{mgr}->disable($slave, join("\n", @errors));
+			$self->{mgr}->disable($slave, join("\n", @errors), '');
 			$self->{stop} = 1;
 			return 2;
 		}
@@ -1215,7 +1229,7 @@ sub mysqlclient_errors
 		if ($err)
 		{
 			chomp $err;
-			_i($self->{logprefix}."CLIENT ERROR: ".$err);
+			_err($self->{logprefix}."CLIENT ERROR: ".$err);
 			push @errors, $err;
 			$self->{mgr}->set_status($slave, 'sql', 'error: mysql client');
 		}
@@ -1223,7 +1237,7 @@ sub mysqlclient_errors
 	# handle mysql client errors
 	if(@errors)
 	{
-		_i($self->{logprefix}."Unable to connect on MySQL, will retry in ".$self->{bigpause}."s...");
+		_err($self->{logprefix}."Unable to connect on MySQL, will retry in ".$self->{bigpause}."s...");
 		sleep $self->{bigpause};
 		return 1;
 	}
@@ -1264,19 +1278,28 @@ sub IO
 		# fetching and parsing mysqlbinlog output
 		while (!$self->{error} and !$self->{stop})
 		{
-			# still enable ?
 			$self->{slave} = $self->{mgr}->get($self->{name});
 			$slave = $self->{slave};
+			
+			# still enable ?
 			unless ($slave->{enabled})
 			{
 				$self->{stop} = 1;
 				last;
 			}
+			
+			# On error ? => retry later
+			if ($slave->{io_status} =~ /^error/i)
+			{
+				sleep $self->{bigpause};
+				next;
+			}
 
 			# Wait if mysql replication is stopped
 			my $delay = $self->{mgr}->get_slave_delay();
-			if ($delay < 0)
+			if ($delay < 0 or $delay > 120)
 			{
+				_l(3, $self->{logprefix}." Waiting for master, Seconds_Behind_Master=$delay s") unless ($delay < 0) ;
 				sleep $self->{bigpause};
 				next;
 			}
@@ -1307,7 +1330,7 @@ sub IO
 			my $rl = $self->{mgr}->get_last_relaylog($slave);
 			unless (open RELAY, ">".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp")
 			{
-				_i($self->{logprefix}."unable to open relay log file ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).": $!");
+				_err($self->{logprefix}."unable to open relay log file ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).": $!");
 				sleep $self->{bigpause};
 				last;
 			}
@@ -1395,7 +1418,7 @@ sub IO
 			}
 			else
 			{
-				_i("Relay log not fully parsed, removing temporary file");
+				_err("Relay log not fully parsed, removing temporary file");
 				unlink($self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".tmp");
 			}
 			_d($self->{logprefix}."sleep $self->{bigpause}");
@@ -1432,7 +1455,7 @@ sub SQL
 		# check for errors
 		if ($self->mysqlclient_errors())
 		{
-			_i($self->{logprefix}.$self->mysqlclient_errors());
+			_err($self->{logprefix}.$self->mysqlclient_errors());
 			next;
 		}
 		
@@ -1449,6 +1472,14 @@ sub SQL
 				$self->{stop} = 1;
 				_l(3, $self->{logprefix}."this slave is disabled.");
 				last;
+			}
+			
+			# On error ? => retry later
+			if ($slave->{sql_status} =~ /^error/i)
+			{
+				_l(3, $self->{logprefix}."this slave is on error.");
+				sleep $self->{bigpause};
+				next;
 			}
 
 			# refresh config...
@@ -1470,10 +1501,10 @@ sub SQL
 			}
 			if (-e $self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz")
 			{
-				_l(3, $self->{logprefix}."Decompressing relaylog file ...");
+				_l(4, $self->{logprefix}."Decompressing relaylog file ...");
 				if (system("/bin/gzip -d '".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz'") > 0)
 				{
-					_i($self->{logprefix}."unable to gunzip ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz: $!");
+					_err($self->{logprefix}."unable to gunzip ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz: $!");
 					sleep $self->{bigpause};
 					next;
 				}
@@ -1486,7 +1517,7 @@ sub SQL
 			}
 			unless (open RELAY_IN, $self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}))
 			{
-				_i($self->{logprefix}."unable to open ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).": $!");
+				_err($self->{logprefix}."unable to open ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).": $!");
 				sleep $self->{bigpause};
 				next;
 			}
@@ -1542,9 +1573,13 @@ sub SQL
 			_l(2, $self->{logprefix}."$handled handled".($skipped > 0 ? ", $skipped skipped" : ''));
 			#$self->{error} = "No new logs available" if ($handled <= 2);
 			$self->handle_error("end handle_logs");
-			if ($self->{error})
+			if ($self->{error} =~ /Duplicate entry/ and $self->{config}->{general}{skip_duplicates} =~ /yes/i)
 			{
-				_i($self->{logprefix}.$self->{error});
+				_err($self->{logprefix}.$self->{error});
+			}
+			elsif ($self->{error})
+			{
+				_err($self->{logprefix}.$self->{error});
 				_d($self->{logprefix}."sleep $self->{bigpause}");
 				sleep $self->{bigpause};
 			}
@@ -1606,7 +1641,7 @@ sub spawn_child # {{{
 	}
 	else
 	{
-		_i($self->{logprefix}."fork failed: $!");
+		_err($self->{logprefix}."fork failed: $!");
 		die "fork failed: $!";
 	}
 	_d($self->{logprefix}."SHOULD NOT BE HERE => BUG ?");
@@ -1616,11 +1651,12 @@ sub handle_log
 {
 	my ($self, $slave, $log, $rl) = @_;
 	my $db = $self->{config}->{management}{database};
+	$self->{currentlog} = $log; # for handle_error in case of SIGPIPE
 
 	# Some sanity checks
 	unless($db)
 	{
-		_i($self->{logprefix}."MSR database not set.");
+		_err($self->{logprefix}."MSR database not set.");
 		return 0;
 	}
 
@@ -1662,36 +1698,70 @@ sub handle_log
 
 sub handle_error
 {
-	my ($self, $log) = @_;
+	my ($self, $error_or_log) = @_;
 	my $rin = ''; 
 	my $rout;
+
+	my $error = $error_or_log;
+	my $log;
+	if ($error_or_log->isa('Binlog'))
+	{
+		$log = $error_or_log;
+	}
+	elsif (defined($self->{currentlog}) and $self->{currentlog}->isa('Binlog'))
+	{
+		$log = $self->{currentlog};
+	}
+	$self->{currentlog} = undef;
+
 	return 1 unless(defined(fileno(CL_ERR)));
 	vec($rin, fileno(CL_ERR), 1) = 1;
-	_d($self->{logprefix}."handle_error ".$log) unless ($log->isa('Binlog'));
+	_err($self->{logprefix}."handle_error ".$error) unless (defined($log));
 	if (select($rout=$rin, undef, undef, 1) > 0)
 	{
 		my $slave = $self->{mgr}->get($self->{name});
 		while (<CL_ERR>)
 		{
 			chomp;
-			_i($self->{logprefix}."ERROR: $_");
+			_err($self->{logprefix}.$_);
 			$self->{error} = $_;
+			my $disableme = 0;
+			my $stopme = 0;
 			# 1062 = Duplicate entry
 			# 2006 = Has gone away
 			if (/^ERROR (2006|2013)/)
 			{
 				return 1;
 			}
+			elsif (/^ERROR (1062)/)
+			{
+				if ($self->{config}->{general}{skip_duplicates} =~ /yes/i)
+				{
+					$self->{mgr}->skip($slave, 1);
+					return 2;
+				}
+				else
+				{
+					$stopme = 0;
+					$disableme = 1;
+				}
+			}
+			# All errors except 1317
 			unless (/^ERROR (1317)/)
 			{
-				$self->{mgr}->disable($slave, $self->{error});
+				$stopme = 1;
+				$disableme = 1;
 			}
-			$self->{stop} = 1;
+			if ($disableme)
+			{
+				$self->{mgr}->disable($slave, '', $self->{error}.$/.(defined($log) ? $log->to_s : $error));
+			}
+			$self->{stop} = 1 if ($stopme);
 			return 0;
 		}
 	}
 	# no errors detected, however did we have a SIGPIPE ?
-	if ($log eq 'SIGPIPE')
+	if ($error eq 'SIGPIPE')
 	{
 		$self->{error} = 'SIGPIPE' unless ($self->{error});
 		return 0 ;
@@ -1827,7 +1897,7 @@ sub connect
 				{
 					'RaiseError' => 0,
 					'PrintError' => 0,
-					'HandleError' => sub { _i($_[0]); }, # log errors to logger
+					'HandleError' => sub { _err($_[0]); }, # log errors to logger
 				},
 			);
 		if ($h)
@@ -1898,7 +1968,7 @@ sub setup_db
 		_i("Creating database '$self->{database}'");
 		unless($db->do("CREATE DATABASE \`$self->{database}\`"))
 		{
-			_i("Unable to create database '$self->{database}'");
+			_err("Unable to create database '$self->{database}'");
 			$error = 1;
 		}
 	}
@@ -1914,7 +1984,7 @@ sub setup_db
 		_i("Checking table $name");
 		unless($db->do($create))
 		{
-			_i($DBI::errstr);
+			_err($DBI::errstr);
 			$error = 2;
 		}
 	}
@@ -1944,7 +2014,7 @@ sub print_slave
 	my ($self, $name) = @_;
 	unless ($self->exists($name))
 	{
-		_i("Slave ".$name." does not exists.");
+		_err("Slave ".$name." does not exists.");
 		return 1; # exit code
 	}
 	my $slave = $self->{slaves}->{$name};
@@ -2028,7 +2098,7 @@ sub add
 	return 1 unless ($self->is_connected);
 	unless ($self->{dbh}->do(q{INSERT INTO masters SET id = NULL, name = ?}, undef, $slave->{name}))
 	{
-		_i("Unable to add a master row : ".$self->{dbh}->errstr);
+		_err("Unable to add a master row : ".$self->{dbh}->errstr);
 		return 2;
 	}
 	$slave->{id} = $self->{dbh}->last_insert_id(undef, undef, undef, undef);
@@ -2040,7 +2110,7 @@ sub remove
 	my ($self, $slave) = @_;
 	unless ($self->exists($slave))
 	{
-		_i("Slave $slave does not exists.");
+		_err("Slave $slave does not exists.");
 		return 0; # exit code
 	}
 	$slave = _hashref_to_slave($slave);
@@ -2048,11 +2118,11 @@ sub remove
 	$slave = $self->{slaves}->{$slave->{name}};
 	unless ($self->{dbh}->do("DELETE FROM relaylogs WHERE master_id = ?", undef, $slave->{id}))
 	{
-		_i("Unable to remove relay logs for this slave: ".$self->{dbh}->errstr);
+		_err("Unable to remove relay logs for this slave: ".$self->{dbh}->errstr);
 	}
 	unless ($self->{dbh}->do("DELETE FROM masters WHERE id = ?", undef, $slave->{id}))
 	{
-		_i("Unable to remove this slave: ".$self->{dbh}->errstr);
+		_err("Unable to remove this slave: ".$self->{dbh}->errstr);
 		return 2;
 	}
 	
@@ -2066,7 +2136,7 @@ sub change
 	my ($self, $slave) = @_;
 	unless ($self->exists($slave))
 	{
-		_i("Slave ".$slave->{name}." does not exists.");
+		_err("Slave ".$slave->{name}." does not exists.");
 		return 1; # exit code
 	}
 	$slave = _hashref_to_slave($slave);
@@ -2083,7 +2153,7 @@ sub change
 	$h = inet_ntoa($packed_ip) if (defined($packed_ip));
 	unless(defined($h))
 	{
-		_i("Host ".$self->{slaves}->{$slave->{name}}{host}." not found.");
+		_err("Host ".$self->{slaves}->{$slave->{name}}{host}." not found.");
 		return 3;
 	}
 	_d(inet_ntoa($packed_ip));
@@ -2112,7 +2182,7 @@ sub change
 	{
 		if ($self->{slaves}->{$slave->{name}}{enabled} and $self->{slaves}->{$slave->{name}}{io_status} > 0)
 		{
-			_i("Could not change binlog file and position as this slave is enabled and running");
+			_err("Could not change binlog file and position as this slave is enabled and running");
 		}
 		else
 		{
@@ -2143,7 +2213,7 @@ sub get_relaylog_file
 		_l(2, "Creating relay logs directory: $logsdir");
 		unless(mkdir($logsdir, 0700))
 		{
-			_i("unable to mkdir: $!");
+			_err("unable to mkdir: $!");
 		}
 	}
 	if (!-d "$logsdir/$name")
@@ -2151,7 +2221,7 @@ sub get_relaylog_file
 		_l(2, "Creating relay logs directory: $logsdir/$name");
 		unless(mkdir("$logsdir/$name", 0700))
 		{
-			_i("unable to mkdir: $!");
+			_err("unable to mkdir: $!");
 		}
 	}
 	return $logsdir."/".$name."/relaylog-".$id.".log";
@@ -2162,7 +2232,7 @@ sub skip
 	my ($self, $slave, $offset) = @_;
 	unless ($self->exists($slave))
 	{
-		_i("Slave ".$slave->{name}." does not exists.");
+		_err("Slave ".$slave->{name}." does not exists.");
 		return 1; # exit code
 	}
 	$slave = _hashref_to_slave($slave);
@@ -2177,7 +2247,7 @@ sub skip
 	my @bindvalues = ($slave->{id}, $rl->{id});
 	unless ($self->{dbh}->do($query, undef, @bindvalues))
 	{
-		_i("Unable to update a row in relaylogs table : ".$self->{dbh}->errstr);
+		_err("Unable to update a row in relaylogs table : ".$self->{dbh}->errstr);
 	}
 	_d("Configured to skip $offset entries");
 	return 0;
@@ -2187,11 +2257,18 @@ sub enable
 {
 	my ($self, $slave, $enabled, $io_error, $sql_error) = @_;
 	$enabled = defined($enabled) ? $enabled : 1;
+
+	# If disabling for error, do not really disable :
+	if (!$enabled and (defined($io_error) or defined($sql_error)))
+	{
+		$enabled = 1;
+	}
+
 	$io_error = defined($io_error) ? $io_error : '';
 	$sql_error = defined($sql_error) ? $sql_error : '';
 	unless ($self->exists($slave))
 	{
-		_i("Slave ".$slave->{name}." does not exists.");
+		_err("Slave ".$slave->{name}." does not exists.");
 		return 1; # exit code
 	}
 	_d(($enabled ? 'enabling' : 'disabling')." slave ".$slave->{name});
@@ -2201,7 +2278,7 @@ sub enable
 
 	unless ($self->{dbh}->do("UPDATE masters SET enabled = ?, io_error = ?, sql_error=? WHERE id = ?", undef, ($enabled, $io_error, $sql_error, $slave->{id})))
 	{
-		_i("Unable to ".($enabled ? 'enable' : 'disable')." slave[".$slave->{id}."]: ".$self->{dbh}->errstr);
+		_err("Unable to ".($enabled ? 'enable' : 'disable')." slave[".$slave->{id}."]: ".$self->{dbh}->errstr);
 		return 2;
 	}
 	
@@ -2211,10 +2288,39 @@ sub enable
 
 sub disable
 {
-	my ($self, $slave, $error) = @_;
-	$self->set_status($slave, 'io', 'disabled');
-	$self->set_status($slave, 'sql', 'disabled');
-	return $self->enable($slave, 0, $error);
+	my ($self, $slave, $io_error, $sql_error) = @_;
+	my $emailbody;
+	if ($io_error)
+	{
+		$emailbody = "Slave ".$slave->{name}." got an IO error: $io_error";
+		_err($emailbody);
+		$self->set_status($slave, 'io', 'error: mysqlbinlog');
+	}
+	elsif ($sql_error)
+	{
+		$emailbody = "Slave ".$slave->{name}." got an SQL error: $sql_error";
+		_err($emailbody);
+		$self->set_status($slave, 'sql', 'error: mysql client');
+	}
+	else
+	{
+		_err("Slave ".$slave->{name}." is disabled.");
+		$self->set_status($slave, 'io' , 'disabled');
+		$self->set_status($slave, 'sql', 'disabled');
+	}
+	eval
+	{
+		if (open(MAIL, "| mail -s '[ALERT] $0' '".$self->{config}{email}."'"))
+		{
+			print MAIL $emailbody.$/;
+			close MAIL;
+		}
+	};
+	if ($@)
+	{
+		_err("Unable to send alert mail: $@");
+	}
+	return $self->enable($slave, 0, $io_error, $sql_error);
 }
 
 sub get_status
@@ -2222,7 +2328,7 @@ sub get_status
 	my ($self, $slave, $type) = @_;
 	unless ($self->exists($slave))
 	{
-		_i("Slave ".$slave->{name}." does not exists.");
+		_err("Slave ".$slave->{name}." does not exists.");
 		return 1; # exit code
 	}
 	$slave = _hashref_to_slave($slave);
@@ -2235,7 +2341,7 @@ sub set_status
 	my ($self, $slave, $type, $status) = @_;
 	unless ($self->exists($slave))
 	{
-		_i("Slave ".$slave->{name}." does not exists.");
+		_err("Slave ".$slave->{name}." does not exists.");
 		return 1; # exit code
 	}
 	return 0 unless($type =~ /^io|sql$/i);
@@ -2254,7 +2360,7 @@ sub set_status
 		my $query = "UPDATE masters SET ".lc($type)."_status=$i WHERE id=".$self->{slaves}->{$slave->{name}}{id};
 		unless ($self->{dbh}->do($query))
 		{
-			_i("Unable to set ".lc($type)."_status=$status for ".$slave->{name}." : ".$self->{dbh}->errstr);
+			_err("Unable to set ".lc($type)."_status=$status for ".$slave->{name}." : ".$self->{dbh}->errstr);
 			return 2;
 		}
 	}
@@ -2312,22 +2418,26 @@ sub get_relay_logs
 sub get_slave_delay
 {
 	my ($self) = @_;
-	$self->is_connected();
+	unless ($self->is_connected())
+	{
+		_l(2, "Main MySQL SQL Slave is unavailable !");
+		return -1;
+	}
 	my $sss = $self->{dbh}->selectrow_hashref("SHOW SLAVE STATUS");
 
 	# slave not running
 	if ($sss->{Slave_SQL_Running} !~ /yes/i)
 	{
-		_l(2, "MySQL SQL Slave is stopped...");
-		return -1;
+		_l(2, "Main MySQL SQL Slave is stopped...");
+		return -2;
 	}
 	
 	# seconds behind master
 	my $s = $sss->{Seconds_Behind_Master};
 	if ($s eq 'NULL')
 	{
-		_l(2, "MySQL SQL Slave is stopped...");
-		return -2;
+		_l(2, "Main MySQL SQL Slave is stopped...");
+		return -3;
 	}
 	return int($s);
 }
@@ -2379,7 +2489,7 @@ sub add_relaylog
 
 	unless ($self->{dbh}->do($query, undef, @bindvalues))
 	{
-		_i("Unable to insert a row in relaylogs table : ".$self->{dbh}->errstr);
+		_err("Unable to insert a row in relaylogs table : ".$self->{dbh}->errstr);
 		return 0;
 	}
 
@@ -2391,7 +2501,7 @@ sub set_relaylog
 	my ($self, $slave, $rlid) = @_;
 	unless($rlid and $rlid =~ /^\d+$/)
 	{
-		_i("Invalid relay log ID: $rlid");
+		_err("Invalid relay log ID: $rlid");
 		return 0;
 	}
 	$self->is_connected();
@@ -2399,7 +2509,7 @@ sub set_relaylog
 	my @bindvalues = ($rlid, $self->{slaves}->{$slave->{name}}{id});
 	unless ($self->{dbh}->do($query, undef, @bindvalues))
 	{
-		_i("Unable to change master row : ".$self->{dbh}->errstr);
+		_err("Unable to change master row : ".$self->{dbh}->errstr);
 		return 0;
 	}
 	return 1;
@@ -2449,7 +2559,7 @@ sub remove_relaylog
 		}
 		else
 		{
-			_i($lp."Unable to remove $rlfile : $!");
+			_err($lp."Unable to remove $rlfile : $!");
 		}
 	}
 	$self->is_connected();
@@ -2457,7 +2567,7 @@ sub remove_relaylog
 	my @bindvalues = ($slave->{id}, $rl->{id});
 	unless ($self->{dbh}->do($query, undef, @bindvalues))
 	{
-		_i($lp."Unable to remove a row in relaylogs table : ".$self->{dbh}->errstr);
+		_err($lp."Unable to remove a row in relaylogs table : ".$self->{dbh}->errstr);
 	}
 }
 
@@ -2621,7 +2731,7 @@ sub checks
 {
 	my ($config) = @_;
 	use constant NAGIOS_EXIT_CODES => {'OK'=>0,'WARNING'=>1,'CRITICAL'=>2,'UNKNOWN'=>3,'DEPENDENT'=>4};
-	my ($enabled, $ioalive, $sqlalive, $count, $relaylate, $norelaylog) = (0, 0, 0, 0, 0, 0);
+	my ($enabled, $ioalive, $sqlalive, $count, $relaylate, $norelaylog, $onioerror, $onsqlerror) = (0, 0, 0, 0, 0, 0, 0, 0);
 	my $bigpause = defined($config->{general}{bigpause}) ? $config->{general}{bigpause} : 10;
 	my $mgr = new SlaveManager($config);
 
@@ -2634,6 +2744,14 @@ sub checks
 	{
 		$count++;
 		$enabled++ if ($slaves2->{$slave}->{enabled});
+		if ($STATUS[$slaves2->{$slave}->{io_status}] =~ /^error/)
+		{
+			$onioerror++;
+		}
+		if ($STATUS[$slaves2->{$slave}->{sql_status}] =~ /^error/)
+		{
+			$onsqlerror++;
+		}
 		$ioalive++ if ($slaves2->{$slave}->{io_status} > 0 or $slaves2->{$slave}->{io_status} != $slaves->{$slave}->{io_status});
 		$sqlalive++ if ($slaves2->{$slave}->{sql_status} or $slaves2->{$slave}->{sql_status} != $slaves->{$slave}->{sql_status});
 		# check relaylogs
@@ -2645,8 +2763,8 @@ sub checks
 	$relaylate = int($relaylate/$enabled) if ($relaylate and $enabled);
 
 	print "Master $norelaylog has no logs, " if ($norelaylog);
-	print $relaylate." avg relay logs, $ioalive/$enabled IO, $sqlalive/$enabled SQL, $enabled/$count enabled$/";
-	if ($ioalive < $enabled or $sqlalive < $enabled or $enabled < $count or $relaylate > 40)
+	print $relaylate." avg relay logs, $ioalive/$enabled IO, $sqlalive/$enabled SQL, $enabled/$count enabled, $onioerror/$onsqlerror IO/SQL errors$/";
+	if ($ioalive < $enabled or $sqlalive < $enabled or $enabled < $count or $relaylate > 40 or $onioerror > 0 or $onsqlerror > 0)
 	{
 		return NAGIOS_EXIT_CODES->{CRITICAL};
 	}
@@ -2725,7 +2843,7 @@ sub replication_loop
 		}
 		else
 		{
-			_i("No more slave alived...") unless ($no_more_slave_warned);
+			_err("No more slave alived...") unless ($no_more_slave_warned);
 			$no_more_slave_warned = 1;
 			sleep $bigpause;
 		}
@@ -2812,7 +2930,7 @@ sub main
 		cosmetic => 'x',           		#crosses for the level
 		#colors => {'prog' => 'white', 'date' => 'yellow' },
 		colors => !$daemon,
-		#error_header => 'Oops! ', 		#Header for true errors
+		error_header => '', 		#Header for true errors
 		header => '%dd %l[]l %s{}s ',	#The header
 		splash => 1,
 		caller => EZDEBUG ? 'all' : 0);            		#and I want the name of the last sub
@@ -2847,7 +2965,7 @@ sub main
 	$mysqlbinlogversion = $1;
 	unless ($mysqlbinlogversion >= MYSQLBINLOG_MIN_VER)
 	{
-		_i("Need mysqlbinlog version >= ".MYSQLBINLOG_MIN_VER);
+		_err("Need mysqlbinlog version >= ".MYSQLBINLOG_MIN_VER);
 		exit 1;
 	}
 
@@ -2867,7 +2985,7 @@ sub main
 		# Check write access
 		unless (open(PF, ">$pidfile"))
 		{
-			_i("Can't write to pidfile $pidfile: $!");
+			_err("Can't write to pidfile $pidfile: $!");
 			die "Can't write to pidfile $pidfile: $!\n";
 		}
 		close PF;
