@@ -872,6 +872,7 @@ sub set_position
 			$self->{next_pos} = $pos;
 			$self->{is_full} = 1;
 		}
+		# else I'm in a transaction
 	}
 	else
 	{
@@ -1007,6 +1008,7 @@ use warnings FATAL => 'all';
 use Carp;
 use English qw(-no_match_vars);
 use POSIX qw(setsid floor ceil strftime);
+use Time::HiRes qw( gettimeofday tv_interval );
 use IPC::Open3;
 Log->import();
 use constant EZDEBUG => $ENV{EZDEBUG} || 0;
@@ -1084,15 +1086,26 @@ sub is_alive
 sub stop
 {
 	my ($self) = @_;
-	$self->{stop} = 1;
+	my $sndchance = 0;
+	# Already asked for stopping ? => kill -9
+	$sndchance = 1 if ($self->{stop} == 7);
+	$self->{stop} = 7 if ($self->{stop} < 1);
 	foreach my $type (PROCESSES)
 	{
 		_i('-n', $self->{logprefix}."Stopping ".$self->{name}."::$type : ");
 
 		# Ask child to stop
 		# Warning $self->{mgr} is destroyed with the child
-		_i('-n', "kill(".$self->{lc($type)."pid"}.")...");
-		kill 15, $self->{lc($type)."pid"}; # Child::stop++
+		if ($sndchance)
+		{
+			_i('-n', "kill9(".$self->{lc($type)."pid"}.")...");
+			kill 9, $self->{lc($type)."pid"}; # Child::stop++
+		}
+		else
+		{
+			_i('-n', "kill(".$self->{lc($type)."pid"}.")...");
+			kill 15, $self->{lc($type)."pid"}; # Child::stop++
+		}
 
 		_i('-n', "wait...");
 		waitpid($self->{lc($type)."pid"}, 0);
@@ -1172,7 +1185,7 @@ sub mysqlbinlog_errors
 		else
 		{
 			$self->{mgr}->disable($slave, join("\n", @errors), '');
-			$self->{stop} = 1;
+			$self->{stop} = 2;
 			return 2;
 		}
 	}
@@ -1200,14 +1213,14 @@ sub mysqlclient
 	my ($self) = @_;
 	my $slave = $self->{slave};
 	my $mysqlbin = defined($self->{config}{general}{mysqlbin}) ? $self->{config}{general}{mysqlbin} : '/usr/local/mysql/bin';
-	my @params = qw/--no-defaults --unbuffered --no-beep --batch --reconnect --wait --skip-column-names/;
+	my @params = qw/--no-defaults --unbuffered --no-beep --batch --skip-reconnect --wait --skip-column-names --no-auto-rehash/;
 	push @params, '--user', $self->{config}{mysql}{user};
 	push @params, '--password='.$self->{config}{mysql}{password} if ($self->{config}{mysql}{password});
 	push @params, '--host', $self->{config}{mysql}{host} if ($self->{config}{mysql}{host});
 	push @params, '--port', $self->{config}{mysql}{port} if ($self->{config}{mysql}{port});
 	push @params, '--socket', $self->{config}{mysql}{sock} if ($self->{config}{mysql}{sock});
 	my @cllog = ($mysqlbin, '/mysql ', map { "$_ " } @params);
-	_l(3, $self->{logprefix}, grep { $_ !~ /^--password/ } @cllog);
+	_l(5, $self->{logprefix}, grep { $_ !~ /^--password/ } @cllog);
 	
 	my $clpid = open3(*CL_IN, *CL_OUT, *CL_ERR, $mysqlbin.'/mysql', @params);
 	CL_IN->autoflush(1);
@@ -1255,15 +1268,71 @@ sub mysqlclient_quit
 	close CL_IN;
 	close CL_OUT;
 
-	_d($self->{logprefix}."Waiting for mysql client pid: $clpid");
-	kill 15, $clpid;
+	_l(5, $self->{logprefix}."Waiting for MySQL client to exit...");
+
+	# 60s max :
+	my $ttc = [gettimeofday()]; # time to close
+	sleep 0.1;
+	my $closedproperly = $self->mysqlclient_state($clpid);
+	for (my $i=0; $i<1000; $i++) # 0.1 + 300 * 0.2 + ( 1000 - 300 ) seconds = 25min
+	{
+		if ($closedproperly)
+		{
+			_d($self->{logprefix}."closed properly in : $clpid");
+			last;
+		}
+		else
+		{
+			if ($i < 300) # first minute
+			{
+				sleep 0.2;
+			}
+			else
+			{
+				sleep 1;
+			}
+			$closedproperly = $self->mysqlclient_state($clpid);
+		}
+	}
+
+	$ttc = 1000*tv_interval($ttc, [gettimeofday()]);
+	if ($closedproperly)
+	{
+		_l(2, $self->{logprefix}."MySQL client closed properly in ".$ttc."s");
+	}
+	else
+	{
+		_err($self->{logprefix}."MySQL client not closed, killing($clpid)");
+		_d($self->{logprefix}."Waiting for mysql client pid: $clpid");
+		kill 15, $clpid;
+	}
+
 	waitpid($clpid, 0);
-	if ($? > 0)
+	if ($? > 0 and $? != 15)
 	{
 		_l(2, $self->{logprefix}."mysql client exit with code=$?");
 	}
 	# reset SIGPIPE error
 	$self->{error} = '';
+}
+
+sub mysqlclient_state
+{
+	my ($self, $clpid) = @_;
+	my $state = '';
+	open(ST, "/proc/$clpid/status") or return 1;
+	while (<ST>)
+	{
+		if (/^State:\s+(\w)/)
+		{
+			$state = $1;
+			last;
+		}
+	}
+	close ST;
+	return 2 if ($state eq 'Z');
+	# else 'R' or 'S' ?
+	return 0;
 }
 
 sub IO
@@ -1284,7 +1353,7 @@ sub IO
 			# still enable ?
 			unless ($slave->{enabled})
 			{
-				$self->{stop} = 1;
+				$self->{stop} = 3;
 				last;
 			}
 			
@@ -1306,6 +1375,7 @@ sub IO
 
 			# refresh config...
 			$self->refresh_config;
+			my $msrdb = $self->{config}->{management}{database};
 			my ($parsed, $added, $excluded) = (0, 0, 0);
 
 			# reset $binlog		
@@ -1348,13 +1418,31 @@ sub IO
 					$parsed++;
 					if ($self->{mgr}->include($slave, $binlog->db) or $binlog->is_end or $binlog->is_rotate)
 					{
+						print RELAY "## ".$binlog->to_s.$/;
+						print RELAY "UPDATE /* MSR_BEFORE */ `$msrdb`.`relaylogs` SET current_pos=".$binlog->pos." WHERE id=".$rl->{id}." ".$binlog->delimiter;
+
+						# Query to UPDATE msr pos, placed after the queries
+						my $msrupdatenextpos = "UPDATE /* MSR_AFTER */ `$msrdb`.`relaylogs` SET current_pos=".$binlog->next_pos." WHERE id=".$rl->{id}." ".$binlog->delimiter;
+
 						# if at the end and not include => keep DELIMITER
 						if (($binlog->is_end or $binlog->is_rotate) and !$self->{mgr}->include($slave, $binlog->db))
 						{
 							# remove everything that is not a SET or DELIMITER or a comment
 							@logbuffer = grep { /^(DELIMITER|SET|[\/#])/; } @logbuffer;
+							splice(@logbuffer, -1, 0, $msrupdatenextpos);
 						}
-						print RELAY "## ".$binlog->to_s.$/;
+						# If at the end of log file, place the UPDATE msr pos _before_ the "# End of log file" comment
+						# which indicates a "full" binlog. After this comment nothing is executed on the slave!
+						elsif ($binlog->is_end or $binlog->is_rotate)
+						{
+							splice(@logbuffer, -2, 0, $msrupdatenextpos);
+						}
+						# Else, juste the UPDATE msr pos after the query
+						else
+						{
+							push @logbuffer, $msrupdatenextpos;
+						}
+
 						print RELAY join('', @logbuffer);
 						RELAY->flush();
 					}
@@ -1461,7 +1549,8 @@ sub SQL
 		
 		# fetching and parsing mysqlbinlog output
 		my $binlog;
-		while (!$self->{error} and !$self->{stop})
+		#while (!$self->{error} and !$self->{stop})
+		# Keep the block, to still use 'last' and 'next' :)
 		{
 			$self->{dbdefined} = 0; # sql definitions (use, delimiter, ...)
 			# still enable ?
@@ -1469,7 +1558,7 @@ sub SQL
 			$slave = $self->{slave};
 			unless ($slave->{enabled})
 			{
-				$self->{stop} = 1;
+				$self->{stop} = 4;
 				_l(3, $self->{logprefix}."this slave is disabled.");
 				last;
 			}
@@ -1501,7 +1590,7 @@ sub SQL
 			}
 			if (-e $self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz")
 			{
-				_l(4, $self->{logprefix}."Decompressing relaylog file ...");
+				_l(5, $self->{logprefix}."Decompressing relaylog file ...");
 				if (system("/bin/gzip -d '".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz'") > 0)
 				{
 					_err($self->{logprefix}."unable to gunzip ".$self->{mgr}->get_relaylog_file($slave->{name}, $rl->{id}).".gz: $!");
@@ -1571,13 +1660,34 @@ sub SQL
 			}
 			close RELAY_IN;
 			_l(2, $self->{logprefix}."$handled handled".($skipped > 0 ? ", $skipped skipped" : ''));
+
+			# Close STDIN from pipe to mysql client ...
+			close CL_IN;
+
+			# then wait for CL_OUT to be closed ...
+			while (!eof(CL_OUT))
+			{
+				_l(3, $self->{logprefix}."Waiting for MySQL client to be closed...(".$rl->{id}.")");
+				while(<CL_OUT>)
+				{
+					chomp;
+					_d("Output for RL(".$rl->{id}."): $_");
+				}
+				sleep(1);
+			}
+
 			#$self->{error} = "No new logs available" if ($handled <= 2);
 			$self->handle_error("end handle_logs");
+
+			# If Duplicate entries are handled, just log but continue
+			#if ($self->{error} =~ /Duplicate entry/ and $self->{config}->{general}{skip_duplicates} =~ /yes/i and $slave->{name} ne 'visit')
 			if ($self->{error} =~ /Duplicate entry/ and $self->{config}->{general}{skip_duplicates} =~ /yes/i)
 			{
-				_err($self->{logprefix}.$self->{error});
+				_err($self->{logprefix}."(end loop) ".$self->{error});
+				$self->{error} = '';
 			}
-			elsif ($self->{error})
+
+			if ($self->{error})
 			{
 				_err($self->{logprefix}.$self->{error});
 				_d($self->{logprefix}."sleep $self->{bigpause}");
@@ -1595,7 +1705,7 @@ sub SQL
 		}
 
 		$self->mysqlclient_quit($clpid);
-		
+
 		# error management
 		if (!$self->{stop} and $self->{error})
 		{
@@ -1629,7 +1739,7 @@ sub spawn_child # {{{
 		my $slave = $self->{slave};
 
 
-		local $SIG{INT} = $SIG{TERM} = sub { _d($self->{logprefix}."got SIG".(shift @_)); $self->{stop}=1; } ;
+		local $SIG{INT} = $SIG{TERM} = sub { _d($self->{logprefix}."got SIG".(shift @_)); $self->{stop}=5; } ;
 		local $SIG{PIPE} = sub { $self->handle_error('SIGPIPE'); } ;
 		local $SIG{HUP} = 'DEFAULT';
 
@@ -1660,13 +1770,6 @@ sub handle_log
 		return 0;
 	}
 
-	# set pos and next_pos BEFORE query
-	my $uqr = "UPDATE /* BEFORE */ `$db`.`relaylogs` SET current_pos=".$log->pos." WHERE id=".$rl->{id}.$log->delimiter;
-	unless(print CL_IN $uqr)
-	{
-		return $self->handle_error($log);
-	}
-
 	# First query: put SETUP queries like DELIMITER and USE
 	if ($self->{dbdefined} == 0 and $log->db)
 	{
@@ -1679,21 +1782,18 @@ sub handle_log
 	
 	foreach my $uq (@{$log->query})
 	{
+		# DEBUG
+		#warn "Q: $uq" if ($slave->{name} eq 'visit');
 		unless(print CL_IN $uq)
 		{
-			return $self->handle_error($log);
+			my $herror = $self->handle_error($log);
+			_err($self->{logprefix}."ERROR in SQL: handle_error=$herror pos=".$log->pos." rl=".$rl->{id}." nextpos=".$log->next_pos);
+			# TODO: if duplicate: ne return pas
+			return $herror;
 		}
 	}
 
-	#
-	# SUCCESS => update position
-	#
-	$uqr = "UPDATE /* AFTER */ `$db`.`relaylogs` SET current_pos=".$log->next_pos." WHERE id=".$rl->{id}.$log->delimiter;
-	unless(print CL_IN $uqr)
-	{
-		# TODO: use $self->{mgr} to force the update of the position
-		return $self->handle_error($log);
-	}
+	return 1;
 }
 
 sub handle_error
@@ -1715,8 +1815,8 @@ sub handle_error
 	$self->{currentlog} = undef;
 
 	return 1 unless(defined(fileno(CL_ERR)));
-	vec($rin, fileno(CL_ERR), 1) = 1;
 	_err($self->{logprefix}."handle_error ".$error) unless (defined($log));
+	vec($rin, fileno(CL_ERR), 1) = 1;
 	if (select($rout=$rin, undef, undef, 1) > 0)
 	{
 		my $slave = $self->{mgr}->get($self->{name});
@@ -1756,7 +1856,7 @@ sub handle_error
 			{
 				$self->{mgr}->disable($slave, '', $self->{error}.$/.(defined($log) ? $log->to_s : $error));
 			}
-			$self->{stop} = 1 if ($stopme);
+			$self->{stop} = 6 if ($stopme and $self->{stop} < 1);
 			return 0;
 		}
 	}
@@ -1904,6 +2004,11 @@ sub connect
 		{
 			$h->do("SET NAMES utf8");
 			$self->{dbh} = $h;
+		}
+		else
+		{
+			# do not forget to unset --> for is_connected()
+			$self->{dbh} = undef;
 		}
 	}
 }
@@ -2289,7 +2394,7 @@ sub enable
 sub disable
 {
 	my ($self, $slave, $io_error, $sql_error) = @_;
-	my $emailbody;
+	my $emailbody = "";
 	if ($io_error)
 	{
 		$emailbody = "Slave ".$slave->{name}." got an IO error: $io_error";
@@ -2518,28 +2623,19 @@ sub set_relaylog
 sub next_relaylog
 {
 	my ($self, $slave) = @_;
-	my $relaylogs = $self->get_relay_logs($slave);
+	#my $relaylogs = $self->get_relay_logs($slave);
 	my $crl = $self->get_current_relaylog($slave);
-	my $next = 0;
 	return 0 unless(defined($crl));
-	foreach my $rl (sort { $a <=> $b } keys %$relaylogs)
+	$self->is_connected();
+	my $n = $self->{dbh}->selectrow_hashref("SELECT * FROM relaylogs WHERE master_id=".$slave->{id}." AND id != ".$crl->{id}." ORDER BY id LIMIT 1");
+	unless (defined($n))
 	{
-		if ($next)
-		{
-			$next = $rl;
-			last;
-		}
-		if ($crl->{id} == $relaylogs->{$rl}->{id})
-		{
-			$next = 1;
-		}
-	}
-	if ($next == 1)
-	{
+		_err("Not able to fetch next relaylog: ".$self->{dbh}->errstr);
 		return 0;
 	}
-	#_d("Next relay log to handle: $next");
-	return $self->set_relaylog($slave, $next) if ($next);
+	my $next = int($n->{id});
+	
+	return $self->set_relaylog($slave, $next) if ($next and $next > 0);
 	return 0;
 }
 
@@ -2549,14 +2645,19 @@ sub remove_relaylog
 	my $rlfile = $self->get_relaylog_file($slave->{name}, $rl->{id});
 	if (-e $rlfile)
 	{
-		#if (open(R, ">>to_remove.sh"))
 		if (unlink($rlfile))
 		{
-			#system("gzip -9 $rlfile");
-			#print R "rm -v $rlfile.gz$/";
 			_d("$lp$rlfile removed");
-			#close R;
 		}
+		## DEBUG
+		#system("gzip -9 $rlfile");
+		#rename($rlfile.".gz", $rlfile.".debug.gz");
+		#if (open(R, ">>/var/tmp/msr2/to_remove.sh"))
+		#{
+		#	print R "rm -v $rlfile.debug.gz$/";
+		#	_d("$lp$rlfile removed");
+		#	close R;
+		#}
 		else
 		{
 			_err($lp."Unable to remove $rlfile : $!");
