@@ -37,6 +37,14 @@
 # Greylist = which databases to replicate, or which to not replicate.
 # Filtering is done only on database, not tables.
 #
+# Documentation about MySQL internals : http://forge.mysql.com/wiki/MySQL_Internals_Binary_Log
+# http://dev.mysql.com/doc/refman/5.5/en/mysqlbinlog-hexdump.html
+# Latest mysqlbinlog binary from 5.6 offers pretty enhancements :
+# http://dev.mysql.com/doc/refman/5.6/en/mysqlbinlog-backup.html
+# 
+# TODO: use my mysqlbinlog
+# http://dev.mysql.com/doc/refman/5.6/en/mysqlbinlog.html
+#
 #######################################################################
 
 
@@ -752,6 +760,21 @@ sub new
 #  exit;
 # output:
 # timethis 100000:  3 wallclock secs ( 2.18 usr +  0.29 sys =  2.47 CPU) @ 40485.83/s (n=100000)
+#
+#
+# TODO : mysqlbinlog --raw (from 5.6) and parse binary binlog
+# Attention ca change le parsing de 'start' par exemple
+# Quid des flags ?
+# Position  Timestamp   Type   Master ID        Size      Master Pos    Flags
+#        4 2c a0 9e 4f   0f   33 00 00 00   67 00 00 00   6b 00 00 00   00 00
+#       17 04 00 35 2e 35 2e 31 30  2d 6c 6f 67 00 00 00 00 |..5.5.10.log....|
+#       27 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+#       37 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
+#       47 00 00 00 00 2c a0 9e 4f  13 38 0d 00 08 00 12 00 |.......O.8......|
+#       57 04 04 04 04 12 00 00 54  00 04 1a 08 00 00 00 08 |.......T........|
+#       67 08 08 02 00  |....|
+#       Start: binlog v 4, server v 5.5.10-log created 120430 16:22:36 at startup
+
 sub parse
 {
 	my ($self, $line) = @_;
@@ -785,8 +808,29 @@ sub parse
 		elsif($line =~ /^use (.+)\/\*!\*\/;/i)
 		{
 			$self->{db} = $1;
-			$self->add($line);
+			#$self->add($line);
 		}
+		# Filtering ROLLBACK added by mysqlbinlog
+		elsif($line =~ /^ROLLBACK \/\* added by mysqlbinlog \*\//)
+		{
+			$line = "-- " . $line;
+		}
+		elsif($self->{type} eq 'start' and ($line =~ /^BINLOG/ or $line =~ /^ROLLBACK/))
+		{
+			$self->{is_in_transaction} = 3;
+			return 0;
+		}
+		elsif($self->{is_in_transaction} == 3 and $line =~ /^'/) # end BINLOG
+		{
+			$self->{is_in_transaction} = 0;
+			return 0;
+		}
+		elsif($self->{is_in_transaction} == 3)
+		{
+			return 0;
+		}
+		# /end filtering
+
 		#
 		# SQL 
 		#
@@ -825,6 +869,7 @@ sub parse
 	{
 		_d("Not parsed: $line");
 	}
+	return 1;
 }
 
 sub set_delimiter_def
@@ -838,6 +883,7 @@ sub set_delimiter_def
 	}
 }
 
+# Used only within "SQL" process
 sub add
 {
 	my ($self, $sql) = @_;
@@ -907,15 +953,15 @@ sub parse_info
 		$self->{type} = 'query';
 	}
 	# from 5.5.8
+	# See MySQL bug #46166 http://bugs.mysql.com/bug.php?id=46166
 	elsif ($self->{type} eq 'stop')
 	{
 		$self->{binlogfile} =~ /(.+)\.(\d+)/;
 		my ($binlogname, $binlogid) = ($1, int($2));
-		$binlogid++;
-		$self->{binlogfile} = "$binlogname.$binlogid";
+		$self->{binlogfile} = "$binlogname." . sprintf("%06d", $binlogid + 1);
 		$self->{pos} = 4;
 	}
-	# before 5.5.8
+	# before 5.5.8, or with --to-last-log (never use this option)
 	elsif ($self->{type} eq 'rotate')
 	{
 		# This log appears 2 times: at the start and at the end of the binlog 
@@ -951,9 +997,10 @@ sub to_s
 	my ($self) = @_;
 	my $delim = $self->{delimiter};
 	chomp($delim);
-	return "[".$self->{type}."] db:".$self->{db}." date:".strftime('%d/%m/%Y %H:%M:%S', localtime($self->date))." file:".$self->{binlogfile}." pos:".$self->{pos}." next:".$self->{next_pos}." lines:".scalar(@{$self->{sql}});
+	return "[".$self->{type}."] db:".$self->{db}." date:".strftime('%d/%m/%Y %H:%M:%S', localtime($self->date))." file:".$self->{binlogfile}." pos:".$self->{pos}." next:".$self->{next_pos};
 }
 
+# Used only within "SQL" process
 sub query
 {
 	my ($self) = @_;
@@ -1011,9 +1058,9 @@ use POSIX qw(setsid floor ceil strftime);
 use Time::HiRes qw( gettimeofday tv_interval );
 use IPC::Open3;
 Log->import();
-use constant EZDEBUG => $ENV{EZDEBUG} || 0;
+use constant DEBUG => $ENV{DEBUG} || 0;
 use constant PROCESSES => ('IO', 'SQL');
-#use constant PROCESSES => ('SQL');
+#use constant PROCESSES => ('IO');
 
 sub new
 {
@@ -1037,6 +1084,7 @@ sub new
 	$self->{'mgr'} = new SlaveManager($self->{config}, 1);
 	foreach my $type (PROCESSES)
 	{
+		next if (DEBUG > 0 and $type eq 'SQL');
 		$self->{lc($type)."pid"} = $self->spawn_child($name, $type);
 	}
 	return $self;
@@ -1092,6 +1140,11 @@ sub stop
 	$self->{stop} = 7 if ($self->{stop} < 1);
 	foreach my $type (PROCESSES)
 	{
+		unless ($self->{lc($type)."pid"} > 0)
+		{
+			_i("Process $type not running => not killing.");
+			next;
+		}
 		_i('-n', $self->{logprefix}."Stopping ".$self->{name}."::$type : ");
 
 		# Ask child to stop
@@ -1121,7 +1174,9 @@ sub mysqlbinlog
 	my $slave = $self->{slave};
 	my $stopdatetime = strftime('%Y-%m-%d %H:%M:%S', localtime(time() - $delay - 60));
 	my $mysqlbin = defined($self->{config}{general}{mysqlbin}) ? $self->{config}{general}{mysqlbin} : '/usr/local/mysql/bin';
-	my @params = qw/--no-defaults --set-charset UTF8 --read-from-remote-server/;
+	my $mysqlbinlog = defined($self->{config}{general}{mysqlbinlog}) ? $self->{config}{general}{mysqlbinlog} : "$mysqlbin/mysqlbinlog";
+	my @params = defined($self->{config}{general}{mysqlbinlogopts}) ? $self->{config}{general}{mysqlbinlogopts} : "";
+	push @params, '--read-from-remote-server';
 	push @params, '--user', $slave->{user};
 	push @params, '--password', $slave->{password} if ($slave->{password});
 	push @params, '--host', $slave->{host} if ($slave->{host});
@@ -1132,11 +1187,11 @@ sub mysqlbinlog
 	$rl->{current_pos} = defined($rl->{current_pos}) ? $rl->{current_pos} : $rl->{start_pos};
 
 	push @params, '--start-position', $rl->{current_pos}, $rl->{binlogfile};
-	my @cllog = ($mysqlbin, '/mysqlbinlog ', map { "$_ " } @params);
+	my @cllog = ($mysqlbinlog, map { "$_ " } @params);
 	_l(3, $self->{logprefix}, grep { $_ !~ /^--password/ } @cllog);
 
 	# TODO: put this open3 in an eval()
-	my $mblpid = open3(*BL_IN, *BL_OUT, *BL_ERR, $mysqlbin.'/mysqlbinlog', @params);
+	my $mblpid = open3(*BL_IN, *BL_OUT, *BL_ERR, $mysqlbinlog, @params);
 	close BL_IN;
 	return $mblpid;
 }
@@ -1411,8 +1466,11 @@ sub IO
 			my @logbuffer = ();
 			while (!$self->{stop} and !eof(BL_OUT) and my $l = <BL_OUT>) # till end 
 			{
-				$binlog->parse($l);
-				push @logbuffer, $l;
+				unless ($binlog->parse($l))
+				{
+					$l = "## MSRFILTERED: $l";
+				}
+				push @logbuffer, $l ;
 				if ($binlog->is_full)
 				{
 					$parsed++;
@@ -2415,7 +2473,7 @@ sub disable
 	}
 	eval
 	{
-		if (open(MAIL, "| mail -s '[ALERT] $0' '".$self->{config}{email}."'"))
+		if (defined($ENV{DEBUG}) and open(MAIL, "| mail -s '[ALERT] $0' '".$self->{config}{email}."'"))
 		{
 			print MAIL $emailbody.$/;
 			close MAIL;
@@ -2529,6 +2587,12 @@ sub get_slave_delay
 		return -1;
 	}
 	my $sss = $self->{dbh}->selectrow_hashref("SHOW SLAVE STATUS");
+
+	# Is not a slave, skipping test
+	unless (defined($sss))
+	{
+		return 0;
+	}
 
 	# slave not running
 	if ($sss->{Slave_SQL_Running} !~ /yes/i)
@@ -2696,7 +2760,7 @@ use English qw(-no_match_vars);
 use FindBin qw($RealBin);
 Log->import();
 
-use constant EZDEBUG => $ENV{EZDEBUG} || 0;
+use constant DEBUG => $ENV{DEBUG} || 0;
 use constant MYSQLBINLOG_MIN_VER => 3.2;
 
 our $VERSION = '@VERSION@';
@@ -3034,7 +3098,7 @@ sub main
 		error_header => '', 		#Header for true errors
 		header => '%dd %l[]l %s{}s ',	#The header
 		splash => 1,
-		caller => EZDEBUG ? 'all' : 0);            		#and I want the name of the last sub
+		caller => DEBUG ? 'all' : 0);            		#and I want the name of the last sub
 
 	#
 	# Checks mode ?
@@ -3061,7 +3125,8 @@ sub main
 	# /usr/local/mysql/bin/mysqlbinlog --no-defaults -V
 	# /usr/local/mysql/bin/mysqlbinlog Ver 3.3 for unknown-linux-gnu at x86_64
 	my $mysqlbin = defined($config->{general}{mysqlbin}) ? $config->{general}{mysqlbin} : '/usr/local/mysql/bin';
-	my $mysqlbinlogversion = `$mysqlbin/mysqlbinlog --no-defaults -V`;
+	my $mysqlbinlog = defined($config->{general}{mysqlbinlog}) ? $config->{general}{mysqlbinlog} : "$mysqlbin/mysqlbinlog";
+	my $mysqlbinlogversion = `$mysqlbinlog --no-defaults -V`;
 	$mysqlbinlogversion =~ /Ver (\d+.\d+) /;
 	$mysqlbinlogversion = $1;
 	unless ($mysqlbinlogversion >= MYSQLBINLOG_MIN_VER)
