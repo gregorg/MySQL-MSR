@@ -42,8 +42,10 @@
 # Latest mysqlbinlog binary from 5.6 offers pretty enhancements :
 # http://dev.mysql.com/doc/refman/5.6/en/mysqlbinlog-backup.html
 # 
-# TODO: use my mysqlbinlog
-# http://dev.mysql.com/doc/refman/5.6/en/mysqlbinlog.html
+# TODOs: 
+# use my mysqlbinlog to force latest version http://dev.mysql.com/doc/refman/5.6/en/mysqlbinlog.html
+# mysqlbinlog --raw (from 5.6) and parse binary binlog
+# Uses options --to-last-log and --stop-never
 #
 #######################################################################
 
@@ -762,18 +764,6 @@ sub new
 # timethis 100000:  3 wallclock secs ( 2.18 usr +  0.29 sys =  2.47 CPU) @ 40485.83/s (n=100000)
 #
 #
-# TODO : mysqlbinlog --raw (from 5.6) and parse binary binlog
-# Attention ca change le parsing de 'start' par exemple
-# Quid des flags ?
-# Position  Timestamp   Type   Master ID        Size      Master Pos    Flags
-#        4 2c a0 9e 4f   0f   33 00 00 00   67 00 00 00   6b 00 00 00   00 00
-#       17 04 00 35 2e 35 2e 31 30  2d 6c 6f 67 00 00 00 00 |..5.5.10.log....|
-#       27 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-#       37 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00 |................|
-#       47 00 00 00 00 2c a0 9e 4f  13 38 0d 00 08 00 12 00 |.......O.8......|
-#       57 04 04 04 04 12 00 00 54  00 04 1a 08 00 00 00 08 |.......T........|
-#       67 08 08 02 00  |....|
-#       Start: binlog v 4, server v 5.5.10-log created 120430 16:22:36 at startup
 
 sub parse
 {
