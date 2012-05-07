@@ -1165,7 +1165,7 @@ sub mysqlbinlog
 	my $stopdatetime = strftime('%Y-%m-%d %H:%M:%S', localtime(time() - $delay - 60));
 	my $mysqlbin = defined($self->{config}{general}{mysqlbin}) ? $self->{config}{general}{mysqlbin} : '/usr/local/mysql/bin';
 	my $mysqlbinlog = defined($self->{config}{general}{mysqlbinlog}) ? $self->{config}{general}{mysqlbinlog} : "$mysqlbin/mysqlbinlog";
-	my @params = defined($self->{config}{general}{mysqlbinlogopts}) ? $self->{config}{general}{mysqlbinlogopts} : "";
+	my @params = defined($self->{config}{general}{mysqlbinlogopts}) ? split(/ /, $self->{config}{general}{mysqlbinlogopts}) : "";
 	push @params, '--read-from-remote-server';
 	push @params, '--user', $slave->{user};
 	push @params, '--password', $slave->{password} if ($slave->{password});
@@ -1177,7 +1177,7 @@ sub mysqlbinlog
 	$rl->{current_pos} = defined($rl->{current_pos}) ? $rl->{current_pos} : $rl->{start_pos};
 
 	push @params, '--start-position', $rl->{current_pos}, $rl->{binlogfile};
-	my @cllog = ($mysqlbinlog, map { "$_ " } @params);
+	my @cllog = ($mysqlbinlog, map { " $_" } @params);
 	_l(3, $self->{logprefix}, grep { $_ !~ /^--password/ } @cllog);
 
 	# TODO: put this open3 in an eval()
